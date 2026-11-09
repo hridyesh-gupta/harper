@@ -1,7 +1,7 @@
-use crate::windows_broker::automation_service::AutomationService;
+use crate::windows_broker::automation_service::{AutomationService, ReadStep};
 use crate::{
     os_broker::{AccessibilityPermissionStatus, AppSearchResult, OsBroker},
-    rect::ActionableLint,
+    rect::{ActionableLint, Rect},
 };
 use cached::cached;
 use egui::Pos2;
@@ -9,6 +9,7 @@ use harper_core::linting::Lint;
 use std::ffi::{OsString, c_void};
 use std::os::windows::ffi::OsStringExt;
 use std::process::Command;
+use std::time::{Duration, Instant};
 use std::{
     collections::BTreeMap,
     path::PathBuf,
@@ -29,12 +30,28 @@ use wintheon::file::{IconSize, Priority};
 use wintheon::gather::Gatherer;
 mod automation_service;
 
+/// Minimum time between two reads of the focused text, so the overlay does not flood the focused
+/// app's accessibility provider.
+const READ_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Lints that have been computed and are waiting for their bounding boxes.
+struct PendingLints {
+    text: String,
+    lints: BTreeMap<String, Vec<Lint>>,
+}
+
 pub struct WindowsBroker {
     service: Arc<Mutex<AutomationService>>,
     is_integration_enabled: Box<dyn FnMut(&str) -> bool + Send + Sync>,
-    /// The window the most recent `get_boxes` call read from, so a failed read in a different
-    /// window clears that window's lints instead of carrying them over.
+    /// The window the current lints were read from, so a failed read in a different window clears
+    /// them instead of carrying them over.
     lint_source_window: Option<isize>,
+    /// The window the read in progress targets.
+    read_window: Option<isize>,
+    /// Text that has been linted and is waiting for its bounding boxes.
+    pending_lints: Option<PendingLints>,
+    /// When the last read cycle started.
+    last_read_started: Option<Instant>,
 }
 
 impl WindowsBroker {
@@ -45,7 +62,69 @@ impl WindowsBroker {
             service: Arc::new(Mutex::new(AutomationService::create_and_start())),
             is_integration_enabled: Box::new(is_integration_enabled),
             lint_source_window: None,
+            read_window: None,
+            pending_lints: None,
+            last_read_started: None,
         }
+    }
+
+    /// Drops any read in progress, for example when the focused window must not be linted.
+    fn abandon_read(&mut self) {
+        if let Ok(mut service) = self.service.lock() {
+            service.discard_pending();
+        }
+        self.pending_lints = None;
+        self.read_window = None;
+    }
+
+    /// After a failed read, clears the lints if they came from a window other than `window`.
+    ///
+    /// Returning `None` keeps the previous lints, which stops a momentary accessibility failure
+    /// from making highlights flicker. In a different window those lints and their popup belong
+    /// to an app the user has left, so they are cleared instead.
+    fn clear_lints_from_other_window(&mut self, window: isize) -> Option<Vec<ActionableLint>> {
+        let changed = self.lint_source_window != Some(window);
+        self.lint_source_window = Some(window);
+        changed.then(Vec::new)
+    }
+
+    /// Pairs each lint with its bounding boxes and the action that applies a suggestion to the
+    /// source text.
+    fn actionable_lints(
+        &self,
+        text: String,
+        lints: BTreeMap<String, Vec<Lint>>,
+        rects: Vec<Vec<Rect>>,
+    ) -> Vec<ActionableLint> {
+        lints
+            .into_iter()
+            .flat_map(|(lint_id, lints)| {
+                lints.into_iter().map(move |lint| (lint_id.clone(), lint))
+            })
+            .zip(rects)
+            .flat_map(|((lint_id, lint), rects)| {
+                let text = text.clone();
+                let service = self.service.clone();
+                rects.into_iter().map(move |rect| {
+                    let service = service.clone();
+                    let suggestion_text = text.clone();
+                    let suggestion_span = lint.span;
+                    ActionableLint::new(
+                        rect,
+                        lint_id.clone(),
+                        lint.clone(),
+                        text.clone(),
+                        move |suggestion| {
+                            service.lock().unwrap().apply_suggestion(
+                                suggestion_text,
+                                suggestion_span,
+                                suggestion,
+                            );
+                        },
+                    )
+                })
+            })
+            .collect()
     }
 
     pub fn should_lint_focused_window(&mut self) -> Option<bool> {
@@ -90,67 +169,62 @@ impl OsBroker for WindowsBroker {
     ) -> Option<Vec<ActionableLint>> {
         match self.should_lint_focused_window() {
             Some(true) => {}
-            Some(false) => return Some(Vec::new()),
+            Some(false) => {
+                self.abandon_read();
+                return Some(Vec::new());
+            }
             None => return None,
         }
 
-        let window = self.service.lock().ok()?.resolve_focused_window()?;
-        let window_changed = self.lint_source_window != Some(window);
-        self.lint_source_window = Some(window);
+        let mut service = self.service.lock().ok()?;
+        let window = service.resolve_focused_window()?;
 
-        // Returning `None` keeps the previous lints, which stops a momentary accessibility failure
-        // from making highlights flicker. In a different window those lints and their popup belong
-        // to an app the user has left, so they are cleared instead.
-        let on_failed_read = || window_changed.then(Vec::new);
-
-        let Some(text) = self.service.lock().ok()?.get_text() else {
-            return on_failed_read();
-        };
-        if text.len() > 16_000 {
-            return Some(Vec::new());
+        if self.read_window != Some(window) {
+            // The focus moved, so a result for the previous window is no longer wanted.
+            service.discard_pending();
+            self.pending_lints = None;
+            self.read_window = Some(window);
         }
 
-        let lints = lint_text(&text);
-        let Some(rects) = self
-            .service
-            .lock()
-            .ok()?
-            .get_bounding_boxes(&text, lints.values().flatten().map(|lint| lint.span))
-        else {
-            return on_failed_read();
-        };
+        // Each call advances the read by at most one step and never waits for the accessibility
+        // worker, so a slow provider cannot stall the event loop that owns the overlay windows.
+        match service.poll() {
+            ReadStep::Pending => None,
+            ReadStep::Idle => {
+                let due = self
+                    .last_read_started
+                    .is_none_or(|started| started.elapsed() >= READ_INTERVAL);
+                if due && service.request_text() {
+                    self.last_read_started = Some(Instant::now());
+                }
+                None
+            }
+            ReadStep::Failed => {
+                self.pending_lints = None;
+                self.clear_lints_from_other_window(window)
+            }
+            ReadStep::Text(text) => {
+                if text.len() > 16_000 {
+                    self.lint_source_window = Some(window);
+                    return Some(Vec::new());
+                }
+                drop(service);
 
-        Some(
-            lints
-                .into_iter()
-                .flat_map(|(lint_id, lints)| {
-                    lints.into_iter().map(move |lint| (lint_id.clone(), lint))
-                })
-                .zip(rects)
-                .flat_map(|((lint_id, lint), rects)| {
-                    let text = text.clone();
-                    let service = self.service.clone();
-                    rects.into_iter().map(move |rect| {
-                        let service = service.clone();
-                        let suggestion_text = text.clone();
-                        let suggestion_span = lint.span;
-                        ActionableLint::new(
-                            rect,
-                            lint_id.clone(),
-                            lint.clone(),
-                            text.clone(),
-                            move |suggestion| {
-                                service.lock().unwrap().apply_suggestion(
-                                    suggestion_text,
-                                    suggestion_span,
-                                    suggestion,
-                                );
-                            },
-                        )
-                    })
-                })
-                .collect(),
-        )
+                let lints = lint_text(&text);
+                let spans = lints.values().flatten().map(|lint| lint.span);
+                if !self.service.lock().ok()?.request_rects(&text, spans) {
+                    return None;
+                }
+                self.pending_lints = Some(PendingLints { text, lints });
+                None
+            }
+            ReadStep::Rects(rects) => {
+                drop(service);
+                let PendingLints { text, lints } = self.pending_lints.take()?;
+                self.lint_source_window = Some(window);
+                Some(self.actionable_lints(text, lints, rects))
+            }
+        }
     }
 
     fn cursor_position(&self) -> Option<Pos2> {
