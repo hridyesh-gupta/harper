@@ -32,6 +32,9 @@ mod automation_service;
 pub struct WindowsBroker {
     service: Arc<Mutex<AutomationService>>,
     is_integration_enabled: Box<dyn FnMut(&str) -> bool + Send + Sync>,
+    /// The window the most recent `get_boxes` call read from, so a failed read in a different
+    /// window clears that window's lints instead of carrying them over.
+    lint_source_window: Option<isize>,
 }
 
 impl WindowsBroker {
@@ -41,6 +44,7 @@ impl WindowsBroker {
         Self {
             service: Arc::new(Mutex::new(AutomationService::create_and_start())),
             is_integration_enabled: Box::new(is_integration_enabled),
+            lint_source_window: None,
         }
     }
 
@@ -90,17 +94,31 @@ impl OsBroker for WindowsBroker {
             None => return None,
         }
 
-        let text = self.service.lock().ok()?.get_text()?;
+        let window = self.service.lock().ok()?.resolve_focused_window()?;
+        let window_changed = self.lint_source_window != Some(window);
+        self.lint_source_window = Some(window);
+
+        // Returning `None` keeps the previous lints, which stops a momentary accessibility failure
+        // from making highlights flicker. In a different window those lints and their popup belong
+        // to an app the user has left, so they are cleared instead.
+        let on_failed_read = || window_changed.then(Vec::new);
+
+        let Some(text) = self.service.lock().ok()?.get_text() else {
+            return on_failed_read();
+        };
         if text.len() > 16_000 {
             return Some(Vec::new());
         }
 
         let lints = lint_text(&text);
-        let rects = self
+        let Some(rects) = self
             .service
             .lock()
             .ok()?
-            .get_bounding_boxes(&text, lints.values().flatten().map(|lint| lint.span))?;
+            .get_bounding_boxes(&text, lints.values().flatten().map(|lint| lint.span))
+        else {
+            return on_failed_read();
+        };
 
         Some(
             lints
@@ -138,8 +156,10 @@ impl OsBroker for WindowsBroker {
     fn cursor_position(&self) -> Option<Pos2> {
         let mut point = POINT::default();
 
+        // `GetCursorPos` fails while the lock screen or another secure desktop has the input,
+        // which must not bring down the highlighter process.
         unsafe {
-            GetCursorPos(&mut point).unwrap();
+            GetCursorPos(&mut point).ok()?;
         }
 
         let monitor_scale = get_focused_monitor_scale();

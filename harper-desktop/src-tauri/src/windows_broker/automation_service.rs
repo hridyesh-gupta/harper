@@ -287,45 +287,72 @@ fn get_text(element: &UIElement) -> uiautomation::Result<String> {
 
 /// Finds the focused text element below `window`.
 ///
-/// When `expected_text` is provided, unrelated text providers are excluded.
+/// Chromium-based apps, including Electron apps, report keyboard focus on both the focused text
+/// field and the document that contains it, and a subtree search lists the container first. The
+/// element the system itself reports as focused is preferred, falling back to the last (deepest)
+/// match, so the text field wins over its container.
+///
+/// When `expected_text` is provided, unrelated text providers are excluded. Clicking Harper's own
+/// popup can take keyboard focus away from the source element before a suggestion is applied, so
+/// the search then also accepts an unfocused element that holds exactly the expected text.
 fn text_element_for_window(
     automation: &UIAutomation,
     window: isize,
     expected_text: Option<&str>,
 ) -> uiautomation::Result<UIElement> {
     let root = automation.element_from_handle(Handle::from(window))?;
-    let text_condition = automation.create_property_condition(
-        UIProperty::IsTextPatternAvailable,
-        Variant::from(true),
-        None,
-    )?;
+    let text_condition = || {
+        automation.create_property_condition(
+            UIProperty::IsTextPatternAvailable,
+            Variant::from(true),
+            None,
+        )
+    };
     let keyboard_condition = automation.create_property_condition(
         UIProperty::HasKeyboardFocus,
         Variant::from(true),
         None,
     )?;
-    let condition = automation.create_and_condition(text_condition, keyboard_condition)?;
+    let focused_condition =
+        automation.create_and_condition(text_condition()?, keyboard_condition)?;
+    let focused_elements = root.find_all(TreeScope::Subtree, &focused_condition)?;
 
-    for element in root.find_all(TreeScope::Subtree, &condition)? {
-        if let Some(expected) = expected_text {
-            let text = get_text(&element);
+    let Some(expected) = expected_text else {
+        let system_focused = automation.get_focused_element().ok();
+        let is_system_focused = |element: &UIElement| {
+            system_focused.as_ref().is_some_and(|focused| {
+                automation
+                    .compare_elements(element, focused)
+                    .unwrap_or(false)
+            })
+        };
 
-            let Ok(text) = text else {
-                continue;
-            };
+        return focused_elements
+            .iter()
+            .find(|element| is_system_focused(element))
+            .or(focused_elements.last())
+            .cloned()
+            .ok_or_else(no_text_element);
+    };
 
-            if expected != text {
-                continue;
-            }
-        }
+    let holds_expected_text =
+        |element: &UIElement| get_text(element).is_ok_and(|text| text == expected);
 
-        return Ok(element);
+    if let Some(element) = focused_elements
+        .iter()
+        .find(|element| holds_expected_text(element))
+    {
+        return Ok(element.clone());
     }
 
-    Err(Error::new(
-        uiautomation::errors::ERR_NOTFOUND,
-        "no text element found",
-    ))
+    root.find_all(TreeScope::Subtree, &text_condition()?)?
+        .into_iter()
+        .find(holds_expected_text)
+        .ok_or_else(no_text_element)
+}
+
+fn no_text_element() -> Error {
+    Error::new(uiautomation::errors::ERR_NOTFOUND, "no text element found")
 }
 
 fn get_text_job(automation: &UIAutomation, args: Vec<JobArgument>) -> JobResult {
