@@ -7,10 +7,13 @@ use crate::rect::Rect;
 use crate::windows_broker::get_focused_monitor_scale;
 use harper_core::{Span, linting::Suggestion};
 use is_macro::Is;
-use uiautomation::types::{Handle, TextPatternRangeEndpoint, TextUnit, TreeScope, UIProperty};
+use uiautomation::types::{
+    ControlType, Handle, TextPatternRangeEndpoint, TextUnit, TreeScope, UIProperty,
+};
 use uiautomation::variants::Variant;
 use uiautomation::{
     UIAutomation, UIElement,
+    core::UICondition,
     patterns::{UITextPattern, UIValuePattern},
 };
 use windows::Win32::Foundation::HWND;
@@ -285,7 +288,35 @@ fn get_text(element: &UIElement) -> uiautomation::Result<String> {
     range.get_text(-1)
 }
 
-/// Finds the focused text element below `window`.
+/// Matches text providers the user can type into.
+///
+/// Text that is only displayed, such as a web page or a chat transcript, also exposes the text
+/// pattern and can hold keyboard focus, which made Harper lint whole pages. Everything the user
+/// can edit reports a value that is not read-only, so elements with a read-only value and plain
+/// text labels are excluded.
+fn editable_text_condition(automation: &UIAutomation) -> uiautomation::Result<UICondition> {
+    let property = |property: UIProperty, value: Variant| {
+        automation.create_property_condition(property, value, None)
+    };
+
+    let has_text = property(UIProperty::IsTextPatternAvailable, Variant::from(true))?;
+    let read_only_value = automation.create_and_condition(
+        property(UIProperty::IsValuePatternAvailable, Variant::from(true))?,
+        property(UIProperty::ValueIsReadOnly, Variant::from(true))?,
+    )?;
+    let label = property(
+        UIProperty::ControlType,
+        Variant::from(ControlType::Text as i32),
+    )?;
+    let editable = automation.create_and_condition(
+        automation.create_not_condition(read_only_value)?,
+        automation.create_not_condition(label)?,
+    )?;
+
+    automation.create_and_condition(has_text, editable)
+}
+
+/// Finds the focused editable text element below `window`.
 ///
 /// Chromium-based apps, including Electron apps, report keyboard focus on both the focused text
 /// field and the document that contains it, and a subtree search lists the container first. The
@@ -301,20 +332,13 @@ fn text_element_for_window(
     expected_text: Option<&str>,
 ) -> uiautomation::Result<UIElement> {
     let root = automation.element_from_handle(Handle::from(window))?;
-    let text_condition = || {
-        automation.create_property_condition(
-            UIProperty::IsTextPatternAvailable,
-            Variant::from(true),
-            None,
-        )
-    };
     let keyboard_condition = automation.create_property_condition(
         UIProperty::HasKeyboardFocus,
         Variant::from(true),
         None,
     )?;
     let focused_condition =
-        automation.create_and_condition(text_condition()?, keyboard_condition)?;
+        automation.create_and_condition(editable_text_condition(automation)?, keyboard_condition)?;
     let focused_elements = root.find_all(TreeScope::Subtree, &focused_condition)?;
 
     let Some(expected) = expected_text else {
@@ -345,7 +369,7 @@ fn text_element_for_window(
         return Ok(element.clone());
     }
 
-    root.find_all(TreeScope::Subtree, &text_condition()?)?
+    root.find_all(TreeScope::Subtree, &editable_text_condition(automation)?)?
         .into_iter()
         .find(holds_expected_text)
         .ok_or_else(no_text_element)
