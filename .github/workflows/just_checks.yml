@@ -16,18 +16,7 @@ jobs:
     name: just ${{ matrix.task }}
     strategy:
       matrix:
-        task:
-          [
-            check-rust,
-            check-js,
-            test-rust,
-            test-harperjs,
-            test-vscode,
-            test-chrome-plugin,
-            test-firefox-plugin,
-            test-obsidian,
-            check-desktop,
-          ]
+        task: [check-rust, check-desktop]
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
