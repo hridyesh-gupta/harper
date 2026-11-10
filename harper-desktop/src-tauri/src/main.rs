@@ -125,7 +125,40 @@ pub fn main() {
     }
 }
 
+/// Claims a named mutex for the lifetime of the process so that a second launch of Harper exits
+/// instead of adding another tray icon and another highlighter overlay.
+///
+/// Returns `false` when another Harper is already running.
+#[cfg(target_os = "windows")]
+fn claim_single_instance() -> bool {
+    use ::windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError};
+    use ::windows::Win32::System::Threading::CreateMutexW;
+    use ::windows::core::w;
+
+    // The handle is intentionally never closed: Windows releases it, and with it the mutex, when
+    // the process exits.
+    match unsafe { CreateMutexW(None, false, w!("Local\\HarperDesktop.SingleInstance")) } {
+        Ok(handle) => {
+            let already_running = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+            if already_running {
+                let _ = unsafe { CloseHandle(handle) };
+            }
+            !already_running
+        }
+        Err(error) => {
+            eprintln!("failed to create the single-instance mutex: {error}");
+            true
+        }
+    }
+}
+
 pub fn run_tauri() {
+    #[cfg(target_os = "windows")]
+    if !claim_single_instance() {
+        eprintln!("Harper is already running; this copy exits.");
+        return;
+    }
+
     let async_runtime = Builder::new_multi_thread()
         .enable_all()
         .build()
