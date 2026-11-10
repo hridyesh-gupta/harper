@@ -98,9 +98,7 @@ impl WindowsBroker {
     ) -> Vec<ActionableLint> {
         lints
             .into_iter()
-            .flat_map(|(lint_id, lints)| {
-                lints.into_iter().map(move |lint| (lint_id.clone(), lint))
-            })
+            .flat_map(|(lint_id, lints)| lints.into_iter().map(move |lint| (lint_id.clone(), lint)))
             .zip(rects)
             .flat_map(|((lint_id, lint), rects)| {
                 let text = text.clone();
@@ -200,6 +198,7 @@ impl OsBroker for WindowsBroker {
                 None
             }
             ReadStep::Failed => {
+                drop(service);
                 self.pending_lints = None;
                 self.clear_lints_from_other_window(window)
             }
