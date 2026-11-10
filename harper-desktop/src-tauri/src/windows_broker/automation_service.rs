@@ -337,8 +337,8 @@ fn text_element_for_window(
         Variant::from(true),
         None,
     )?;
-    let focused_condition =
-        automation.create_and_condition(editable_text_condition(automation)?, keyboard_condition)?;
+    let focused_condition = automation
+        .create_and_condition(editable_text_condition(automation)?, keyboard_condition)?;
     let focused_elements = root.find_all(TreeScope::Subtree, &focused_condition)?;
 
     let Some(expected) = expected_text else {
