@@ -1,16 +1,17 @@
 use std::iter::once;
-use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
-use std::thread::sleep;
-use std::time::Duration;
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 
 use crate::rect::Rect;
 use crate::windows_broker::get_focused_monitor_scale;
 use harper_core::{Span, linting::Suggestion};
 use is_macro::Is;
-use uiautomation::types::{Handle, TextPatternRangeEndpoint, TextUnit, TreeScope, UIProperty};
+use uiautomation::types::{
+    ControlType, Handle, TextPatternRangeEndpoint, TextUnit, TreeScope, UIProperty,
+};
 use uiautomation::variants::Variant;
 use uiautomation::{
     UIAutomation, UIElement,
+    core::UICondition,
     patterns::{UITextPattern, UIValuePattern},
 };
 use windows::Win32::Foundation::HWND;
@@ -51,12 +52,44 @@ enum JobResult {
 /// An actual function pointer to be run by the worker thread.
 type WorkerJob = fn(&UIAutomation, Vec<JobArgument>) -> JobResult;
 
+/// A job whose result has not been collected yet.
+#[derive(Debug, Clone, Copy)]
+enum InFlight {
+    Text,
+    Rects,
+    /// The caller lost interest, for example because the focused window changed. The result is
+    /// thrown away when it arrives.
+    Discarded,
+}
+
+/// Progress of a non-blocking accessibility read.
+#[derive(Debug)]
+pub enum ReadStep {
+    /// No job is running, so a new one may be started.
+    Idle,
+    /// The worker is still busy; there is nothing to do this frame.
+    Pending,
+    /// The focused element's text.
+    Text(String),
+    /// One group of bounding boxes per requested span, in request order.
+    Rects(Vec<Vec<Rect>>),
+    /// The job failed or produced an unexpected result.
+    Failed,
+}
+
 /// Runs and communicates with a worker thread to interact with the Win32 Automation API to query the accessibility tree.
 /// Necessary because the API has very specific thread setting requirements to work.
+///
+/// Reads are non-blocking: the caller starts a job with `request_text` or `request_rects` and
+/// collects it later with `poll`, so an accessibility provider that answers slowly, as Chromium
+/// does while it is busy, never stalls the overlay's event loop. Applying a suggestion is a user
+/// action and still waits for its result.
 pub struct AutomationService {
     worker_data: Option<WorkerData>,
     // Needed to redirect focus to the last focused window when the focus arrives on the Harper highlighter window
     last_focused_window: Option<isize>,
+    /// The job currently running on the worker, if any.
+    in_flight: Option<InFlight>,
 }
 
 impl AutomationService {
@@ -64,6 +97,7 @@ impl AutomationService {
         let mut output = Self {
             last_focused_window: None,
             worker_data: None,
+            in_flight: None,
         };
 
         output.start_worker_thread();
@@ -80,24 +114,15 @@ impl AutomationService {
         std::thread::spawn(move || {
             let automation = UIAutomation::new().unwrap();
 
-            loop {
+            // `recv` sleeps until a job arrives and fails once the service, and with it the
+            // sending side of the channel, has been dropped.
+            while let Ok((job, arguments)) = job_receiver.recv() {
+                let result = job(&automation, arguments);
+
                 // Stop the thread if the other side of the channel has been closed (or dropped).
-                let job = match job_receiver.try_recv() {
-                    Err(TryRecvError::Disconnected) => break,
-                    Err(TryRecvError::Empty) => None,
-                    Ok(job) => Some(job),
-                };
-
-                if let Some((job, arguments)) = job {
-                    let result = job(&automation, arguments);
-
-                    // Stop the thread if the other side of the channel has been closed (or dropped).
-                    if let Err(TrySendError::Disconnected(_)) = result_sender.try_send(result) {
-                        break;
-                    }
+                if result_sender.send(result).is_err() {
+                    break;
                 }
-
-                sleep(Duration::from_millis(16));
             }
         });
 
@@ -113,23 +138,77 @@ impl AutomationService {
         self.worker_data = None;
     }
 
-    /// Attempts to run a worker job on the worker thread. Returns `None` if the worker thread does not exist.
-    fn run_worker_job(&self, job: WorkerJob, arguments: Vec<JobArgument>) -> Option<JobResult> {
+    /// Runs a worker job and waits for its result. Returns `None` if the worker thread does not
+    /// exist. A job still in flight is waited for and discarded first so results stay in order.
+    fn run_worker_job(&mut self, job: WorkerJob, arguments: Vec<JobArgument>) -> Option<JobResult> {
         let worker_data = self.worker_data.as_ref()?;
-        worker_data.sender.send((job, arguments)).unwrap();
-        Some(worker_data.receiver.recv().unwrap())
+        if self.in_flight.take().is_some() {
+            let _ = worker_data.receiver.recv();
+        }
+        worker_data.sender.send((job, arguments)).ok()?;
+        worker_data.receiver.recv().ok()
     }
 
-    /// Grab text from the worker.
-    /// Attempts to get the most up-to-date information possible.
-    /// Returns `None` if the worker is not running.
-    pub fn get_text(&mut self) -> Option<String> {
-        let window = self.resolve_focused_window()?;
-        let result = self.run_worker_job(get_text_job, vec![JobArgument::Window(window)])?;
+    /// Starts a job without waiting for it. Returns `false` if the worker is missing or busy.
+    fn start_job(&mut self, kind: InFlight, job: WorkerJob, arguments: Vec<JobArgument>) -> bool {
+        if self.in_flight.is_some() {
+            return false;
+        }
+        let Some(worker_data) = self.worker_data.as_ref() else {
+            return false;
+        };
+        if worker_data.sender.try_send((job, arguments)).is_err() {
+            return false;
+        }
+        self.in_flight = Some(kind);
+        true
+    }
 
-        match result {
-            JobResult::String(text) => Some(text),
-            _ => None,
+    /// Starts reading the text of the focused element in the foreground window. Collect the
+    /// result with `poll`.
+    pub fn request_text(&mut self) -> bool {
+        let Some(window) = self.resolve_focused_window() else {
+            return false;
+        };
+        self.start_job(
+            InFlight::Text,
+            get_text_job,
+            vec![JobArgument::Window(window)],
+        )
+    }
+
+    /// Collects the running job's result if it has finished, without waiting.
+    pub fn poll(&mut self) -> ReadStep {
+        let Some(kind) = self.in_flight else {
+            return ReadStep::Idle;
+        };
+        let Some(worker_data) = self.worker_data.as_ref() else {
+            self.in_flight = None;
+            return ReadStep::Failed;
+        };
+
+        match worker_data.receiver.try_recv() {
+            Err(TryRecvError::Empty) => ReadStep::Pending,
+            Err(TryRecvError::Disconnected) => {
+                self.in_flight = None;
+                ReadStep::Failed
+            }
+            Ok(result) => {
+                self.in_flight = None;
+                match (kind, result) {
+                    (InFlight::Discarded, _) => ReadStep::Idle,
+                    (InFlight::Text, JobResult::String(text)) => ReadStep::Text(text),
+                    (InFlight::Rects, JobResult::GroupedRects(rects)) => ReadStep::Rects(rects),
+                    _ => ReadStep::Failed,
+                }
+            }
+        }
+    }
+
+    /// Marks the running job's result as unwanted, for example after the focused window changed.
+    pub fn discard_pending(&mut self) {
+        if self.in_flight.is_some() {
+            self.in_flight = Some(InFlight::Discarded);
         }
     }
 
@@ -156,28 +235,25 @@ impl AutomationService {
         );
     }
 
-    /// Pass a collection of text spans to the worker and have it compute the associated bounding boxes for each span.
-    /// Each span may have multiple bounding boxes.
-    /// Input spans share the same index as their output bounding box.
-    pub fn get_bounding_boxes(
+    /// Starts computing the bounding boxes of `spans` within the focused element holding `text`.
+    /// Each span may have multiple bounding boxes, and the result keeps the input order. Collect
+    /// the result with `poll`.
+    pub fn request_rects(
         &mut self,
         text: &str,
         spans: impl IntoIterator<Item = Span<char>>,
-    ) -> Option<Vec<Vec<Rect>>> {
-        let window = self.resolve_focused_window()?;
-
-        let result = self.run_worker_job(
+    ) -> bool {
+        let Some(window) = self.resolve_focused_window() else {
+            return false;
+        };
+        self.start_job(
+            InFlight::Rects,
             get_bounding_rect_job,
             once(JobArgument::Window(window))
                 .chain(once(JobArgument::Text(text.to_string())))
                 .chain(spans.into_iter().map(JobArgument::Span))
                 .collect(),
-        )?;
-
-        match result {
-            JobResult::GroupedRects(rects) => Some(rects),
-            _ => None,
-        }
+        )
     }
 
     /// Returns the foreground source window, retaining the last external window while Harper's
@@ -285,7 +361,35 @@ fn get_text(element: &UIElement) -> uiautomation::Result<String> {
     range.get_text(-1)
 }
 
-/// Finds the focused text element below `window`.
+/// Matches text providers the user can type into.
+///
+/// Text that is only displayed, such as a web page or a chat transcript, also exposes the text
+/// pattern and can hold keyboard focus, which made Harper lint whole pages. Everything the user
+/// can edit reports a value that is not read-only, so elements with a read-only value and plain
+/// text labels are excluded.
+fn editable_text_condition(automation: &UIAutomation) -> uiautomation::Result<UICondition> {
+    let property = |property: UIProperty, value: Variant| {
+        automation.create_property_condition(property, value, None)
+    };
+
+    let has_text = property(UIProperty::IsTextPatternAvailable, Variant::from(true))?;
+    let read_only_value = automation.create_and_condition(
+        property(UIProperty::IsValuePatternAvailable, Variant::from(true))?,
+        property(UIProperty::ValueIsReadOnly, Variant::from(true))?,
+    )?;
+    let label = property(
+        UIProperty::ControlType,
+        Variant::from(ControlType::Text as i32),
+    )?;
+    let editable = automation.create_and_condition(
+        automation.create_not_condition(read_only_value)?,
+        automation.create_not_condition(label)?,
+    )?;
+
+    automation.create_and_condition(has_text, editable)
+}
+
+/// Finds the focused editable text element below `window`.
 ///
 /// Chromium-based apps, including Electron apps, report keyboard focus on both the focused text
 /// field and the document that contains it, and a subtree search lists the container first. The
@@ -301,20 +405,13 @@ fn text_element_for_window(
     expected_text: Option<&str>,
 ) -> uiautomation::Result<UIElement> {
     let root = automation.element_from_handle(Handle::from(window))?;
-    let text_condition = || {
-        automation.create_property_condition(
-            UIProperty::IsTextPatternAvailable,
-            Variant::from(true),
-            None,
-        )
-    };
     let keyboard_condition = automation.create_property_condition(
         UIProperty::HasKeyboardFocus,
         Variant::from(true),
         None,
     )?;
-    let focused_condition =
-        automation.create_and_condition(text_condition()?, keyboard_condition)?;
+    let focused_condition = automation
+        .create_and_condition(editable_text_condition(automation)?, keyboard_condition)?;
     let focused_elements = root.find_all(TreeScope::Subtree, &focused_condition)?;
 
     let Some(expected) = expected_text else {
@@ -345,7 +442,7 @@ fn text_element_for_window(
         return Ok(element.clone());
     }
 
-    root.find_all(TreeScope::Subtree, &text_condition()?)?
+    root.find_all(TreeScope::Subtree, &editable_text_condition(automation)?)?
         .into_iter()
         .find(holds_expected_text)
         .ok_or_else(no_text_element)
